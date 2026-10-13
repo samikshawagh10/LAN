@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+received_files/
+.DS_Store
