@@ -1,34 +1,10 @@
 #!/usr/bin/env python3
-"""
-Secure LAN Chat & File Transfer - E2EE GUI Client
-==================================================
-Architecture & Security Design:
-    - Transport Layer: TCP stream with 8-byte length-prefixed packet framing
-      to completely eliminate stream fragmentation and packet coalescing issues.
-    - Cryptographic Layer: True End-to-End Encryption (E2EE) using Fernet
-      (AES-128-CBC + PKCS7 padding + HMAC-SHA256 authenticated encryption).
-      The server is a blind relay with no decryption capability.
-    - Application Protocol:
-        * Text Message:  MSG:<username>:<text_content>
-        * File Transfer: FILE:<username>:<filename>:<file_size>:<file_bytes>
-    - Security Controls:
-        * Path traversal defense (os.path.basename, null byte/slash stripping).
-        * Collision avoidance in downloads.
-        * File size verification.
-        * Graceful InvalidToken handling (wrong key or tampering warning).
-    - Concurrency & Thread Safety:
-        * Network reader thread pushes events to a thread-safe queue.Queue.
-        * Tkinter main thread periodically consumes queue events via root.after().
-        * File transmission runs in background worker threads to avoid GUI freezes.
-
-Author: Senior Network Security Engineer & Python GUI Developer
-"""
-
 import base64
 import os
 import platform
 import queue
 import re
+import secrets
 import socket
 import struct
 import subprocess
@@ -45,10 +21,6 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# ==============================================================================
-# PROTOCOL & CRYPTOGRAPHIC CONSTANTS
-# ==============================================================================
-
 # Default shared 32-byte urlsafe base64 Fernet key for immediate zero-config testing
 DEFAULT_PREDEFINED_KEY = b"PizUtw6785WXIWW7U4W9XC4gQKqlOLPuuteSoLopWwo="
 
@@ -60,14 +32,6 @@ DOWNLOAD_DIR_NAME = "received_files"
 
 
 def derive_fernet_key(key_input: str) -> bytes:
-    """
-    Validates or derives a valid 32-byte urlsafe base64 Fernet key.
-    
-    If `key_input` is already a valid 32-byte urlsafe base64 Fernet key,
-    it returns it directly. If the user provided a human-readable passphrase,
-    it deterministically derives a Fernet key using PBKDF2-HMAC-SHA256
-    (100,000 iterations with a fixed domain-separated salt).
-    """
     raw_bytes = key_input.strip().encode("utf-8")
     try:
         # Check if already a valid Fernet key
@@ -85,7 +49,6 @@ def derive_fernet_key(key_input: str) -> bytes:
 
 
 def format_bytes(num_bytes: int) -> str:
-    """Returns human-readable string representation of byte sizes."""
     for unit in ["B", "KB", "MB", "GB"]:
         if num_bytes < 1024.0:
             return f"{num_bytes:.1f} {unit}"
@@ -93,13 +56,20 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes:.1f} TB"
 
 
+def generate_security_code() -> str:
+    """Generates a cryptographically secure 6-digit numeric verification code."""
+    return f"{secrets.randbelow(900000) + 100000:06d}"
+
+
+def format_security_code(code: str) -> str:
+    """Formats a 6-digit code with spacing for readability, e.g. '582 914'."""
+    cleaned = code.strip().replace(" ", "").replace("-", "")
+    if len(cleaned) == 6:
+        return f"{cleaned[:3]} {cleaned[3:]}"
+    return cleaned
+
+
 def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
-    """
-    Reliably reads exactly `num_bytes` from a stream socket.
-    
-    Handles TCP fragmentation by looping until the complete byte count
-    is accumulated or peer disconnects.
-    """
     buffer = bytearray()
     while len(buffer) < num_bytes:
         chunk = sock.recv(min(num_bytes - len(buffer), RECV_CHUNK_SIZE))
@@ -115,18 +85,29 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
 
 
 class SecureChatClient:
-    """
-    Modular, Object-Oriented Secure Chat & File Transfer GUI Client.
-    
-    Combines an event-driven Tkinter frontend with a multi-threaded
-    network socket worker and client-side Fernet E2EE encryption engine.
-    """
-
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        username: Optional[str] = None,
+        host: str = "127.0.0.1",
+        port: int = 5000,
+        key: Optional[str] = None,
+        geometry: Optional[str] = None,
+        autoconnect: bool = False,
+    ) -> None:
         self.root = root
-        self.root.title("Secure LAN Chat & File Transfer (E2EE)")
-        self.root.geometry("860x680")
-        self.root.minsize(720, 520)
+        self.username = username or f"User_{int(time.time()) % 10000:04d}"
+        self.initial_host = host
+        self.initial_port = port
+        self.initial_key = key or DEFAULT_PREDEFINED_KEY.decode("utf-8")
+        self.autoconnect = autoconnect
+
+        self.root.title(f"Secure LAN Chat - [{self.username}] (E2EE)")
+        if geometry:
+            self.root.geometry(geometry)
+        else:
+            self.root.geometry("640x660")
+        self.root.minsize(520, 460)
 
         # Networking State
         self.sock: Optional[socket.socket] = None
@@ -136,7 +117,6 @@ class SecureChatClient:
 
         # Cryptography State
         self.fernet: Optional[Fernet] = None
-        self.username = f"User_{int(time.time()) % 10000:04d}"
 
         # Thread Safety Queue (Socket Thread -> GUI Thread)
         self.gui_queue: queue.Queue = queue.Queue()
@@ -154,11 +134,14 @@ class SecureChatClient:
         # Start periodic GUI queue processor (every 40ms)
         self.root.after(40, self._process_gui_queue)
 
+        # Auto-connect if requested
+        if self.autoconnect:
+            self.root.after(250, self.connect)
+
         # Graceful shutdown handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def _setup_styles(self) -> None:
-        """Configures modern color palette and typography."""
         self.colors = {
             "bg_dark": "#181825",       # Deep Charcoal
             "bg_card": "#1e1e2e",       # Dark Slate panel
@@ -177,7 +160,6 @@ class SecureChatClient:
         self.root.configure(bg=self.colors["bg_dark"])
 
     def _build_ui(self) -> None:
-        """Constructs all Tkinter widgets and layout."""
         # Main Container
         main_frame = tk.Frame(self.root, bg=self.colors["bg_dark"], padx=14, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -198,28 +180,24 @@ class SecureChatClient:
         )
         config_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Row 1: Server IP, Port, Username, Connect Button
+        # Row 1: Server IP, Port, Status Indicator, Connect Button
         row1 = tk.Frame(config_frame, bg=self.colors["bg_card"])
         row1.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(row1, text="Server IP:", bg=self.colors["bg_card"], fg=self.colors["fg_text"], font=("Helvetica", 9)).pack(side=tk.LEFT)
-        self.entry_host = tk.Entry(row1, width=13, bg=self.colors["bg_input"], fg=self.colors["fg_text"], insertbackground="white", bd=1)
-        self.entry_host.insert(0, "127.0.0.1")
-        self.entry_host.pack(side=tk.LEFT, padx=(4, 12))
+        self.entry_host = tk.Entry(row1, width=12, bg=self.colors["bg_input"], fg=self.colors["fg_text"], insertbackground="white", bd=1)
+        self.entry_host.insert(0, self.initial_host)
+        self.entry_host.pack(side=tk.LEFT, padx=(4, 10))
 
         tk.Label(row1, text="Port:", bg=self.colors["bg_card"], fg=self.colors["fg_text"], font=("Helvetica", 9)).pack(side=tk.LEFT)
         self.entry_port = tk.Entry(row1, width=6, bg=self.colors["bg_input"], fg=self.colors["fg_text"], insertbackground="white", bd=1)
-        self.entry_port.insert(0, "5000")
-        self.entry_port.pack(side=tk.LEFT, padx=(4, 12))
-
-        tk.Label(row1, text="Username:", bg=self.colors["bg_card"], fg=self.colors["fg_text"], font=("Helvetica", 9)).pack(side=tk.LEFT)
-        self.entry_user = tk.Entry(row1, width=14, bg=self.colors["bg_input"], fg=self.colors["fg_text"], insertbackground="white", bd=1)
-        self.entry_user.insert(0, self.username)
-        self.entry_user.pack(side=tk.LEFT, padx=(4, 12))
+        self.entry_port.insert(0, str(self.initial_port))
+        self.entry_port.pack(side=tk.LEFT, padx=(4, 10))
 
         self.btn_connect = tk.Button(
             row1,
             text=" Connect ",
+            width=11,
             font=("Helvetica", 9, "bold"),
             bg=self.colors["accent_blue"],
             fg="#11111b",
@@ -238,11 +216,16 @@ class SecureChatClient:
             fg=self.colors["accent_red"],
             font=("Helvetica", 9, "bold"),
         )
-        self.lbl_status_pill.pack(side=tk.RIGHT, padx=10)
+        self.lbl_status_pill.pack(side=tk.RIGHT, padx=8)
 
-        # Row 2: Symmetric Fernet Key / Shared Secret Passphrase
+        # Row 2: Username & Symmetric Fernet Key
         row2 = tk.Frame(config_frame, bg=self.colors["bg_card"])
         row2.pack(fill=tk.X)
+
+        tk.Label(row2, text="Username:", bg=self.colors["bg_card"], fg=self.colors["fg_text"], font=("Helvetica", 9)).pack(side=tk.LEFT)
+        self.entry_user = tk.Entry(row2, width=12, bg=self.colors["bg_input"], fg=self.colors["fg_text"], insertbackground="white", bd=1)
+        self.entry_user.insert(0, self.username)
+        self.entry_user.pack(side=tk.LEFT, padx=(4, 10))
 
         tk.Label(row2, text="Secret Key:", bg=self.colors["bg_card"], fg=self.colors["fg_text"], font=("Helvetica", 9)).pack(side=tk.LEFT)
         self.entry_key = tk.Entry(
@@ -253,7 +236,7 @@ class SecureChatClient:
             bd=1,
             show="*",
         )
-        self.entry_key.insert(0, DEFAULT_PREDEFINED_KEY.decode("utf-8"))
+        self.entry_key.insert(0, self.initial_key)
         self.entry_key.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
 
         self.btn_toggle_key = tk.Button(
@@ -437,7 +420,6 @@ class SecureChatClient:
             self.connect()
 
     def connect(self) -> None:
-        """Establishes TCP connection to the relay server and initializes E2EE."""
         host = self.entry_host.get().strip()
         port_str = self.entry_port.get().strip()
         user = self.entry_user.get().strip()
@@ -496,8 +478,25 @@ class SecureChatClient:
         )
         self.listen_thread.start()
 
+        # Announce presence to any peers already in the room
+        try:
+            announce_packet = b"SYS_PRESENCE:" + self.username.encode("utf-8") + b":joined"
+            cipher_ann = self.fernet.encrypt(announce_packet)
+            self.sock.sendall(struct.pack(HEADER_FORMAT, len(cipher_ann)) + cipher_ann)
+        except Exception:
+            pass
+
     def disconnect(self, user_initiated: bool = False, reason: str = "") -> None:
         """Disconnects socket cleanly and resets UI state."""
+        # Notify peers that we are disconnecting before closing socket
+        if self.connected and self.sock and self.fernet:
+            try:
+                leave_packet = b"SYS_PRESENCE:" + self.username.encode("utf-8") + b":left"
+                cipher_leave = self.fernet.encrypt(leave_packet)
+                self.sock.sendall(struct.pack(HEADER_FORMAT, len(cipher_leave)) + cipher_leave)
+            except Exception:
+                pass
+
         self.connected = False
         if self.sock:
             try:
@@ -538,12 +537,6 @@ class SecureChatClient:
     # ==========================================================================
 
     def _listen_loop(self) -> None:
-        """
-        Background listener thread. Reads 8-byte framed packets from the TCP stream.
-        
-        Decrypts ciphertext payloads via Fernet.
-        Pushes parsed events to `self.gui_queue` for thread-safe UI updates.
-        """
         sock = self.sock
         while self.connected and self.running:
             try:
@@ -590,16 +583,30 @@ class SecureChatClient:
                 break
 
     def _dispatch_received_packet(self, plaintext: bytes) -> None:
-        """
-        Decodes decrypted application packets and schedules GUI events.
-        
-        Supported Packet Types:
-            MSG:<username>:<text_content>
-            FILE:<username>:<filename>:<size>:<file_bytes>
-            (Also supports fallback formats without username: MSG:<text> and FILE:<filename>:<size>:<file_bytes>)
-        """
+        # --- Handle Peer Presence Announcements ---
+        if plaintext.startswith(b"SYS_PRESENCE:"):
+            parts = plaintext.split(b":", 2)
+            if len(parts) == 3:
+                peer = parts[1].decode("utf-8", errors="replace")
+                action = parts[2].decode("utf-8", errors="replace")
+                if action == "joined":
+                    self.gui_queue.put(("system", f"[SYSTEM] Peer '{peer}' is online and ready for E2EE chat & file transfers."))
+                    # Acknowledge presence so the newly joined peer also knows we are online
+                    try:
+                        if self.sock and self.fernet:
+                            ack_pkt = b"SYS_PRESENCE:" + self.username.encode("utf-8") + b":online"
+                            c_ack = self.fernet.encrypt(ack_pkt)
+                            self.sock.sendall(struct.pack(HEADER_FORMAT, len(c_ack)) + c_ack)
+                    except Exception:
+                        pass
+                elif action == "online":
+                    self.gui_queue.put(("system", f"[SYSTEM] Peer '{peer}' is online and ready."))
+                elif action == "left":
+                    self.gui_queue.put(("system", f"[SYSTEM] Peer '{peer}' has disconnected."))
+            return
+
         # --- Handle Text Messages ---
-        if plaintext.startswith(b"MSG:"):
+        elif plaintext.startswith(b"MSG:"):
             parts = plaintext.split(b":", 2)
             if len(parts) == 3:
                 sender = parts[1].decode("utf-8", errors="replace")
@@ -613,21 +620,51 @@ class SecureChatClient:
 
         # --- Handle File Transfers ---
         elif plaintext.startswith(b"FILE:"):
-            # Packet Structure: FILE:username:filename:size:data (or FILE:filename:size:data)
-            parts = plaintext.split(b":", 4)
-            if len(parts) == 5:
-                sender = parts[1].decode("utf-8", errors="replace")
-                filename = parts[2].decode("utf-8", errors="replace")
-                expected_size = int(parts[3].decode("utf-8", errors="replace"))
-                file_bytes = parts[4]
-            elif len(parts) == 4:
-                sender = "Peer"
-                filename = parts[1].decode("utf-8", errors="replace")
-                expected_size = int(parts[2].decode("utf-8", errors="replace"))
-                file_bytes = parts[3]
-            else:
-                self.gui_queue.put(("error", "Malformed file packet received."))
-                return
+            # Packet Structure:
+            # Secure Transfer (with Security Code): FILE:<username>:<filename>:<code:6-digits>:<size>:<data>
+            # Legacy Transfer: FILE:<username>:<filename>:<size>:<data> (or FILE:<filename>:<size>:<data>)
+            parts6 = plaintext.split(b":", 5)
+            is_secure_format = False
+            security_code = ""
+
+            if len(parts6) == 6:
+                code_cand = parts6[3].decode("utf-8", errors="ignore")
+                size_cand = parts6[4].decode("utf-8", errors="ignore")
+                if code_cand.isdigit() and len(code_cand) == 6 and size_cand.isdigit():
+                    try:
+                        expected_size = int(size_cand)
+                        if len(parts6[5]) == expected_size:
+                            is_secure_format = True
+                            sender = parts6[1].decode("utf-8", errors="replace")
+                            filename = parts6[2].decode("utf-8", errors="replace")
+                            security_code = code_cand
+                            file_bytes = parts6[5]
+                    except ValueError:
+                        pass
+
+            if not is_secure_format:
+                parts_legacy = plaintext.split(b":", 4)
+                if len(parts_legacy) == 5:
+                    sender = parts_legacy[1].decode("utf-8", errors="replace")
+                    filename = parts_legacy[2].decode("utf-8", errors="replace")
+                    try:
+                        expected_size = int(parts_legacy[3].decode("utf-8", errors="replace"))
+                    except ValueError:
+                        self.gui_queue.put(("error", "Invalid file size in legacy packet."))
+                        return
+                    file_bytes = parts_legacy[4]
+                elif len(parts_legacy) == 4:
+                    sender = "Peer"
+                    filename = parts_legacy[1].decode("utf-8", errors="replace")
+                    try:
+                        expected_size = int(parts_legacy[2].decode("utf-8", errors="replace"))
+                    except ValueError:
+                        self.gui_queue.put(("error", "Invalid file size in legacy packet."))
+                        return
+                    file_bytes = parts_legacy[3]
+                else:
+                    self.gui_queue.put(("error", "Malformed file packet received."))
+                    return
 
             # Integrity check
             if len(file_bytes) != expected_size:
@@ -637,23 +674,28 @@ class SecureChatClient:
                 ))
                 return
 
-            # Save file safely to disk
-            saved_path, err = self._save_file_securely(filename, file_bytes)
-            if err:
-                self.gui_queue.put(("error", f"Failed to save received file '{filename}': {err}"))
+            if not security_code:
+                # Direct save for legacy transfers without security code
+                saved_path, err = self._save_file_securely(filename, file_bytes)
+                if err:
+                    self.gui_queue.put(("error", f"Failed to save received file '{filename}': {err}"))
+                else:
+                    self.gui_queue.put(("file_received", sender, filename, saved_path, expected_size, ""))
             else:
-                self.gui_queue.put(("file_received", sender, filename, saved_path, expected_size))
+                # Requires receiver security code entry to unlock and save
+                self.gui_queue.put((
+                    "file_incoming",
+                    sender,
+                    filename,
+                    security_code,
+                    file_bytes,
+                    expected_size,
+                ))
 
         else:
             self.gui_queue.put(("error", "Unknown packet structure received."))
 
     def _save_file_securely(self, raw_filename: str, file_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Prevents Path Traversal Attacks (CWE-22) and securely saves file.
-        
-        Sanitizes directory separators, null bytes, and traversal tokens ('../').
-        Prevents accidental file overwriting by appending an incremental index.
-        """
         try:
             # 1. Strip directory components and dangerous characters
             safe_filename = os.path.basename(raw_filename).strip()
@@ -710,7 +752,6 @@ class SecureChatClient:
         self.entry_message.delete(0, tk.END)
 
     def choose_and_send_file(self) -> None:
-        """Opens OS-native file dialog and dispatches background file sender."""
         if not self.connected or not self.sock:
             messagebox.showinfo("Not Connected", "Please connect to the relay server first.")
             return
@@ -719,17 +760,19 @@ class SecureChatClient:
         if not file_path:
             return
 
+        # Generate a cryptographically secure 6-digit security code for this transfer
+        security_code = generate_security_code()
+
         # Spawn background worker to prevent Tkinter GUI freeze during file reading/encryption
         thread = threading.Thread(
             target=self._send_file_worker,
-            args=(file_path,),
+            args=(file_path, security_code),
             name="FileSenderWorker",
             daemon=True,
         )
         thread.start()
 
-    def _send_file_worker(self, file_path: str) -> None:
-        """Background thread worker for reading, encrypting, and sending large files."""
+    def _send_file_worker(self, file_path: str, security_code: str) -> None:
         try:
             if not os.path.exists(file_path):
                 self.gui_queue.put(("error", f"File not found: {file_path}"))
@@ -744,18 +787,23 @@ class SecureChatClient:
                 return
 
             filename = os.path.basename(file_path)
-            self.gui_queue.put(("system", f"[SYSTEM] Encrypting & transmitting file '{filename}' ({format_bytes(file_size)})..."))
+            self.gui_queue.put((
+                "system",
+                f"[SYSTEM] Encrypting & transmitting file '{filename}' ({format_bytes(file_size)}) with Security Code...",
+            ))
 
             # Step 1: Read file bytes
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
 
-            # Step 2: Build Application Packet: FILE:<username>:<filename>:<file_size>:<file_bytes>
+            # Step 2: Build Application Packet: FILE:<username>:<filename>:<security_code>:<file_size>:<file_bytes>
             packet = (
                 b"FILE:"
                 + self.username.encode("utf-8")
                 + b":"
                 + filename.encode("utf-8")
+                + b":"
+                + security_code.encode("utf-8")
                 + b":"
                 + str(file_size).encode("utf-8")
                 + b":"
@@ -771,7 +819,7 @@ class SecureChatClient:
             # Step 5: Transmit over TCP socket
             self.sock.sendall(frame)
 
-            self.gui_queue.put(("file_sent", filename, file_size))
+            self.gui_queue.put(("file_sent", filename, file_size, security_code))
 
         except Exception as e:
             self.gui_queue.put(("error", f"Failed to send file '{os.path.basename(file_path)}': {e}"))
@@ -781,11 +829,6 @@ class SecureChatClient:
     # ==========================================================================
 
     def _process_gui_queue(self) -> None:
-        """
-        Runs on the Tkinter main thread. Consumes events from `self.gui_queue`.
-        
-        Guarantees that widgets are only accessed from the main thread.
-        """
         try:
             while True:
                 event = self.gui_queue.get_nowait()
@@ -795,13 +838,18 @@ class SecureChatClient:
                     _, sender, text = event
                     self._append_message_ui(sender, text, is_self=False)
 
-                elif event_type == "file_received":
-                    _, sender, filename, saved_path, file_size = event
-                    self._append_file_card_ui(sender, filename, saved_path, file_size, is_self=False)
-
                 elif event_type == "file_sent":
-                    _, filename, file_size = event
-                    self._append_file_card_ui("You", filename, "", file_size, is_self=True)
+                    _, filename, file_size, security_code = event
+                    self._append_file_card_ui("You", filename, "", file_size, is_self=True, security_code=security_code)
+                    self._show_sender_security_code_dialog(filename, file_size, security_code)
+
+                elif event_type == "file_incoming":
+                    _, sender, filename, security_code, file_bytes, expected_size = event
+                    self._prompt_incoming_file_security_code(sender, filename, security_code, file_bytes, expected_size)
+
+                elif event_type == "file_received":
+                    _, sender, filename, saved_path, file_size, security_code = event
+                    self._append_file_card_ui(sender, filename, saved_path, file_size, is_self=False, security_code=security_code)
 
                 elif event_type == "system":
                     _, msg = event
@@ -828,18 +876,321 @@ class SecureChatClient:
             self.root.after(40, self._process_gui_queue)
 
     # ==========================================================================
+    # SECURITY CODE DIALOGS & POPUPS
+    # ==========================================================================
+
+    def _center_toplevel(self, window: tk.Toplevel, width: int, height: int) -> None:
+        """Centers a Toplevel modal dialog smoothly over the main client window."""
+        window.update_idletasks()
+        try:
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            x = rx + max(0, (rw - width) // 2)
+            y = ry + max(0, (rh - height) // 2)
+            window.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            window.geometry(f"{width}x{height}")
+
+    def _show_sender_security_code_dialog(self, filename: str, file_size: int, code: str) -> None:
+        """Displays a popup dialog to the sender showing the 6-digit security code for verification."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("🔐 File Transfer Security Code")
+        dialog.configure(bg=self.colors["bg_card"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        width, height = 440, 320
+        self._center_toplevel(dialog, width, height)
+
+        content = tk.Frame(dialog, bg=self.colors["bg_card"], padx=20, pady=18)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        lbl_title = tk.Label(
+            content,
+            text="🔐 File Transfer Security Code",
+            font=("Helvetica", 12, "bold"),
+            bg=self.colors["bg_card"],
+            fg=self.colors["accent_blue"],
+        )
+        lbl_title.pack(anchor=tk.CENTER, pady=(0, 6))
+
+        lbl_details = tk.Label(
+            content,
+            text=f"File: {filename} ({format_bytes(file_size)})",
+            font=("Helvetica", 9),
+            bg=self.colors["bg_card"],
+            fg=self.colors["fg_text"],
+            wraplength=390,
+        )
+        lbl_details.pack(anchor=tk.CENTER, pady=(0, 10))
+
+        # Prominent Code Display Box
+        code_formatted = format_security_code(code)
+        code_frame = tk.Frame(
+            content,
+            bg=self.colors["bg_input"],
+            bd=1,
+            relief=tk.SOLID,
+            padx=16,
+            pady=10,
+        )
+        code_frame.pack(fill=tk.X, pady=(0, 12))
+
+        lbl_code = tk.Label(
+            code_frame,
+            text=code_formatted,
+            font=("Courier", 24, "bold"),
+            bg=self.colors["bg_input"],
+            fg=self.colors["accent_amber"],
+        )
+        lbl_code.pack(anchor=tk.CENTER)
+
+        lbl_instruction = tk.Label(
+            content,
+            text="Share this one-time 6-digit security code with the recipient.\nThey must enter it to unlock and save the file.",
+            font=("Helvetica", 9),
+            bg=self.colors["bg_card"],
+            fg=self.colors["fg_muted"],
+            justify=tk.CENTER,
+        )
+        lbl_instruction.pack(anchor=tk.CENTER, pady=(0, 14))
+
+        # Action Buttons
+        btn_frame = tk.Frame(content, bg=self.colors["bg_card"])
+        btn_frame.pack(fill=tk.X)
+
+        def copy_code():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+            btn_copy.configure(text="✔ Copied!", bg=self.colors["accent_green"])
+            dialog.after(1500, lambda: btn_copy.configure(text="📋 Copy Code", bg=self.colors["bg_input"]))
+
+        btn_copy = tk.Button(
+            btn_frame,
+            text="📋 Copy Code",
+            font=("Helvetica", 9, "bold"),
+            bg=self.colors["bg_input"],
+            fg=self.colors["fg_text"],
+            bd=1,
+            cursor="hand2",
+            padx=10,
+            command=copy_code,
+        )
+        btn_copy.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+
+        btn_ok = tk.Button(
+            btn_frame,
+            text=" OK ",
+            font=("Helvetica", 9, "bold"),
+            bg=self.colors["accent_blue"],
+            fg="#11111b",
+            bd=1,
+            cursor="hand2",
+            padx=16,
+            command=dialog.destroy,
+        )
+        btn_ok.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(6, 0))
+
+        dialog.bind("<Return>", lambda e: dialog.destroy())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        # Lift dialog above main window
+        dialog.lift()
+        dialog.focus_force()
+
+    def _prompt_incoming_file_security_code(
+        self,
+        sender: str,
+        filename: str,
+        security_code: str,
+        file_bytes: bytes,
+        expected_size: int,
+    ) -> None:
+        """Prompts the receiver to enter the sender's 6-digit security code before saving."""
+        try:
+            self.root.bell()
+        except Exception:
+            pass
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("🔐 Incoming Secure File Transfer")
+        dialog.configure(bg=self.colors["bg_card"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        width, height = 450, 360
+        self._center_toplevel(dialog, width, height)
+
+        attempts_left = [3]
+
+        content = tk.Frame(dialog, bg=self.colors["bg_card"], padx=20, pady=16)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        # Header
+        lbl_title = tk.Label(
+            content,
+            text="🔐 Incoming File Transfer",
+            font=("Helvetica", 13, "bold"),
+            bg=self.colors["bg_card"],
+            fg=self.colors["accent_green"],
+        )
+        lbl_title.pack(anchor=tk.CENTER, pady=(0, 6))
+
+        # Details
+        size_str = format_bytes(expected_size)
+        lbl_details = tk.Label(
+            content,
+            text=f"Sender: {sender}\nFile: {filename} ({size_str})",
+            font=("Helvetica", 9, "bold"),
+            bg=self.colors["bg_card"],
+            fg=self.colors["fg_text"],
+            justify=tk.CENTER,
+            wraplength=400,
+        )
+        lbl_details.pack(anchor=tk.CENTER, pady=(0, 8))
+
+        # Instructions
+        lbl_instruction = tk.Label(
+            content,
+            text=f"A security code is required to receive this file.\nEnter the 6-digit code provided by {sender}:",
+            font=("Helvetica", 9),
+            bg=self.colors["bg_card"],
+            fg=self.colors["fg_muted"],
+            justify=tk.CENTER,
+        )
+        lbl_instruction.pack(anchor=tk.CENTER, pady=(0, 8))
+
+        # Code Entry
+        entry_code = tk.Entry(
+            content,
+            font=("Courier", 18, "bold"),
+            justify="center",
+            bg=self.colors["bg_input"],
+            fg=self.colors["accent_amber"],
+            insertbackground="white",
+            bd=1,
+            relief=tk.SOLID,
+            width=12,
+        )
+        entry_code.pack(anchor=tk.CENTER, ipady=4, pady=(0, 6))
+        entry_code.focus_set()
+
+        # Status / Feedback label
+        lbl_status = tk.Label(
+            content,
+            text="(Ask sender for their 6-digit security code)",
+            font=("Helvetica", 8),
+            bg=self.colors["bg_card"],
+            fg=self.colors["fg_muted"],
+        )
+        lbl_status.pack(anchor=tk.CENTER, pady=(0, 12))
+
+        # Action Buttons
+        btn_frame = tk.Frame(content, bg=self.colors["bg_card"])
+        btn_frame.pack(fill=tk.X)
+
+        def on_accept():
+            user_code = entry_code.get().strip().replace(" ", "").replace("-", "")
+            target_code = security_code.strip().replace(" ", "").replace("-", "")
+
+            if not user_code:
+                lbl_status.configure(text="Please enter the 6-digit code.", fg=self.colors["accent_amber"])
+                return
+
+            if user_code == target_code:
+                # Code verified!
+                dialog.destroy()
+                saved_path, err = self._save_file_securely(filename, file_bytes)
+                if err:
+                    self._append_to_chat("tag_security", f"[ERROR] Failed to save file '{filename}': {err}\n")
+                else:
+                    self._append_file_card_ui(
+                        sender,
+                        filename,
+                        saved_path,
+                        expected_size,
+                        is_self=False,
+                        security_code=security_code,
+                    )
+                    self._append_to_chat(
+                        "tag_system",
+                        f"[SYSTEM] File '{filename}' verified with security code ({format_security_code(security_code)}) and saved to {saved_path}\n",
+                    )
+            else:
+                attempts_left[0] -= 1
+                if attempts_left[0] > 0:
+                    lbl_status.configure(
+                        text=f"❌ Incorrect security code! ({attempts_left[0]} attempt{'s' if attempts_left[0] > 1 else ''} remaining)",
+                        fg=self.colors["accent_red"],
+                    )
+                    entry_code.delete(0, tk.END)
+                    entry_code.focus_set()
+                else:
+                    dialog.destroy()
+                    self._append_to_chat(
+                        "tag_security",
+                        f"[SECURITY ALERT] File transfer for '{filename}' from {sender} rejected: Maximum invalid code attempts reached.\n",
+                    )
+                    messagebox.showerror(
+                        "Transfer Rejected",
+                        f"Security code verification failed for '{filename}'.\nFile transfer rejected for security.",
+                    )
+
+        def on_decline():
+            dialog.destroy()
+            self._append_to_chat(
+                "tag_system",
+                f"[SYSTEM] Incoming file transfer for '{filename}' from {sender} was declined.\n",
+            )
+
+        btn_decline = tk.Button(
+            btn_frame,
+            text="✖ Decline",
+            font=("Helvetica", 9),
+            bg=self.colors["bg_input"],
+            fg=self.colors["fg_text"],
+            bd=1,
+            cursor="hand2",
+            padx=12,
+            pady=4,
+            command=on_decline,
+        )
+        btn_decline.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+
+        btn_unlock = tk.Button(
+            btn_frame,
+            text="✔ Unlock & Receive",
+            font=("Helvetica", 9, "bold"),
+            bg=self.colors["accent_green"],
+            fg="#11111b",
+            bd=1,
+            cursor="hand2",
+            padx=12,
+            pady=4,
+            command=on_accept,
+        )
+        btn_unlock.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(6, 0))
+
+        dialog.bind("<Return>", lambda e: on_accept())
+        dialog.bind("<Escape>", lambda e: on_decline())
+        dialog.protocol("WM_DELETE_WINDOW", on_decline)
+
+        dialog.lift()
+        dialog.focus_force()
+
+    # ==========================================================================
     # CHAT RENDERING HELPERS
     # ==========================================================================
 
     def _append_to_chat(self, tag: str, text: str) -> None:
-        """Inserts text into the read-only ScrolledText widget with specific styling."""
         self.chat_display.configure(state=tk.NORMAL)
         self.chat_display.insert(tk.END, text, tag)
         self.chat_display.see(tk.END)
         self.chat_display.configure(state=tk.DISABLED)
 
     def _append_message_ui(self, sender: str, text: str, is_self: bool) -> None:
-        """Formats and displays a text message bubble."""
         now_str = datetime.now().strftime("%H:%M:%S")
         self.chat_display.configure(state=tk.NORMAL)
 
@@ -858,26 +1209,33 @@ class SecureChatClient:
         self.chat_display.configure(state=tk.DISABLED)
 
     def _append_file_card_ui(
-        self, sender: str, filename: str, saved_path: str, file_size: int, is_self: bool
+        self,
+        sender: str,
+        filename: str,
+        saved_path: str,
+        file_size: int,
+        is_self: bool,
+        security_code: str = "",
     ) -> None:
-        """Displays a dedicated card badge for file transfers."""
         now_str = datetime.now().strftime("%H:%M:%S")
         size_str = format_bytes(file_size)
         self.chat_display.configure(state=tk.NORMAL)
 
         self.chat_display.insert(tk.END, f"[{now_str}] ", "tag_time")
         if is_self:
-            self.chat_display.insert(tk.END, " 📁 FILE SENT ", "tag_file_badge")
+            self.chat_display.insert(tk.END, " 📁 FILE SENT (SECURE) ", "tag_file_badge")
+            code_line = f"\n  • Security Code: {format_security_code(security_code)} (Share with recipient)" if security_code else ""
             self.chat_display.insert(
                 tk.END,
-                f"\n  • Filename: {filename}\n  • Size: {size_str}\n  • Status: Delivered to blind relay\n\n",
+                f"\n  • Filename: {filename}\n  • Size: {size_str}{code_line}\n  • Status: Delivered to relay (Awaiting recipient code verification)\n\n",
                 "tag_file_details",
             )
         else:
-            self.chat_display.insert(tk.END, " 📥 FILE RECEIVED ", "tag_file_badge")
+            self.chat_display.insert(tk.END, " 📥 FILE RECEIVED & VERIFIED ", "tag_file_badge")
+            code_line = f"\n  • Security Code: Verified ({format_security_code(security_code)})" if security_code else ""
             self.chat_display.insert(
                 tk.END,
-                f"\n  • Sender: {sender}\n  • Filename: {filename}\n  • Size: {size_str}\n  • Saved to: {saved_path}\n\n",
+                f"\n  • Sender: {sender}\n  • Filename: {filename}\n  • Size: {size_str}{code_line}\n  • Saved to: {saved_path}\n\n",
                 "tag_file_details",
             )
 
@@ -889,7 +1247,6 @@ class SecureChatClient:
     # ==========================================================================
 
     def on_closing(self) -> None:
-        """Invoked when user clicks window close button. Cleanly releases sockets."""
         self.running = False
         self.disconnect(user_initiated=True, reason="Client GUI closed.")
         self.root.destroy()
@@ -901,9 +1258,27 @@ class SecureChatClient:
 
 
 def main() -> None:
-    """Initializes the Tkinter GUI and SecureChatClient application."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Secure LAN Chat & File Transfer Client")
+    parser.add_argument("--user", type=str, default=None, help="Initial username")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Relay server host")
+    parser.add_argument("--port", type=int, default=5000, help="Relay server port")
+    parser.add_argument("--key", type=str, default=None, help="Shared Fernet key or passphrase")
+    parser.add_argument("--geometry", type=str, default=None, help="Window geometry, e.g. '620x660+50+50'")
+    parser.add_argument("--autoconnect", action="store_true", help="Automatically connect on launch")
+    args = parser.parse_args()
+
     root = tk.Tk()
-    app = SecureChatClient(root)
+    app = SecureChatClient(
+        root,
+        username=args.user,
+        host=args.host,
+        port=args.port,
+        key=args.key,
+        geometry=args.geometry,
+        autoconnect=args.autoconnect,
+    )
     root.mainloop()
 
 

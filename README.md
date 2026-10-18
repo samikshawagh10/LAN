@@ -42,7 +42,8 @@ TCP is a byte-stream protocol with no intrinsic packet boundaries. To eliminate 
 * **Stream Reassembly**: Receivers utilize a dedicated `recv_exact()` reader that accumulates chunks across stream boundaries until the frame is fully assembled.
 * **Packet Layout (Plaintext before encryption)**:
   * **Text Message**: `MSG:<username>:<text_content>`
-  * **File Transfer**: `FILE:<username>:<filename>:<file_size>:<file_bytes>`
+  * **Secure File Transfer (E2EE + Security Code)**: `FILE:<username>:<filename>:<security_code>:<file_size>:<file_bytes>`
+  * **Legacy File Transfer**: `FILE:<username>:<filename>:<file_size>:<file_bytes>`
 
 ### 3. Network Defense & Mitigation
 * **Path Traversal Defense (CWE-22)**: Filenames received from peers are sanitized via `os.path.basename()`, stripping null bytes, forward/backward slashes, and traversal sequences (`..`). Files are strictly saved to the isolated `./received_files/` directory.
@@ -81,7 +82,16 @@ Ensure Python 3.8+ is installed. Install the dependencies:
 pip install -r requirements.txt
 ```
 
-### 2. Start the Relay Server
+### 2. All-in-One Local Demo (Server + 2 Connected Clients)
+To quickly start the relay server and launch two connected clients side-by-side with one command:
+```bash
+python3 launch_lan.py
+```
+This automatically launches **Alice** (left window) and **Bob** (right window), both connected and ready to chat or transfer files immediately.
+
+### 3. Manual / Separate Host Launching
+
+#### Start the Relay Server
 Run the server on the host machine (binds to all interfaces on port `5000` by default):
 ```bash
 python3 server.py --host 0.0.0.0 --port 5000
@@ -115,13 +125,14 @@ python3 client.py
 1. **Sending Messages**: Type your message in the bottom entry field and press **Enter** (or click **Send**).
    * Messages sent by you appear with a blue `You:` header.
    * Messages from peers appear with a purple `Peer (<username>):` header.
-2. **Sending Files**:
-   * Click the **📎 Send File** button.
-   * Select any file (images, PDFs, documents, archives, etc.).
-   * The file is encrypted on your machine and transmitted over the blind relay.
-3. **Receiving Files**:
-   * Incoming files are decrypted, checked for size integrity, and safely written to `./received_files/`.
-   * A badge appears in the chat detailing the file name, size, and destination path.
+2. **Sending Files (with Security Code)**:
+   * Click the **📎 Send File** button and select any file.
+   * A 6-digit **File Transfer Security Code** (e.g., `582 914`) is generated and shown in a popup dialog (with a **📋 Copy Code** button) as well as logged in your chat history.
+   * Share this 6-digit code with your intended recipient so they can unlock the file.
+3. **Receiving Files (Protected Verification)**:
+   * When an incoming file transfer arrives, an authorization modal prompts the recipient to enter the 6-digit security code provided by the sender.
+   * Once the recipient enters the matching code and clicks **✔ Unlock & Receive**, the file is decrypted, integrity-verified, and safely saved to `./received_files/`.
+   * If an incorrect code is entered or the transfer is declined, the file payload is discarded from memory without saving to disk.
    * Click **📁 Downloads** in the bottom right to open the folder directly in your operating system's file manager (Finder / Explorer / Files).
 4. **Changing Keys**:
    * Click **Gen Key** to generate a fresh 32-byte Fernet key.

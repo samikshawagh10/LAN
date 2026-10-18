@@ -1,0 +1,16 @@
+===========================================================
+SECURE LAN CHAT & FILE TRANSFER - SAMPLE TEST DOCUMENT
+===========================================================
+
+Hello! This is a test file demonstrating End-to-End Encryption (E2EE)
+over a Local Area Network (LAN).
+
+Security Features Verified:
+1. Fernet Authenticated Encryption (AES-128-CBC + HMAC-SHA256).
+2. 8-Byte Length-Prefixed Frame Transport (TCP Stream Framing).
+3. Zero-Knowledge Blind Relay Server (No Plaintext Access).
+4. Path Traversal & File Overwrite Protections.
+5. Bit-for-Bit Integrity Assurance.
+
+Enjoy testing the file transfer!
+===========================================================
